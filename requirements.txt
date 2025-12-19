@@ -1,0 +1,7 @@
+# Smart Document Splitter - Requirements
+
+# OpenAI API for LLM-based document splitting
+openai>=1.0.0
+
+# Environment variable management
+python-dotenv>=0.19.0

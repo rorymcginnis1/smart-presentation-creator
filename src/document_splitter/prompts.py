@@ -2,6 +2,8 @@ import re
 import asyncio
 import logging
 import openai
+from typing import List
+from pydantic import BaseModel, Field, field_validator, conint
 from .config import (
     INITIAL_API_TIMEOUT_SECONDS,
     SPLIT_API_TIMEOUT_SECONDS,
@@ -360,3 +362,164 @@ async def split_batch_parallel(sections_to_split, client, model):
         for result in results
     ]
     return results
+
+
+def single_pass_structured(doc, target_slides, client, model):
+    """Single-pass split using structured outputs with mini-section grouping."""
+    target_mini_sections = min(target_slides * 2, 100)
+
+    # Find natural breakpoints - paragraphs are cleanest, then sentences, then lines
+    paragraphs = list(re.finditer(r'\n\n', doc))
+    sentences = list(re.finditer(r'[.!?]\s+', doc))
+    lines = list(re.finditer(r'\n', doc))
+
+    # Use the finest granularity that gives us enough pieces to work with
+    if len(paragraphs) >= target_mini_sections:
+        boundary_positions = [m.end() for m in paragraphs]
+    elif len(paragraphs) + len(sentences) >= target_mini_sections:
+        boundary_positions = [m.end() for m in paragraphs] + [m.end() for m in sentences]
+    else:
+        boundary_positions = [m.end() for m in paragraphs] + [m.end() for m in sentences] + [m.end() for m in lines]
+
+    boundary_positions = sorted(set(p for p in boundary_positions if 0 < p < len(doc)))
+
+    if len(boundary_positions) < target_slides:
+        return None
+
+    # Split document at those boundaries
+    temp_sections = []
+    prev = 0
+    for pos in boundary_positions:
+        temp_sections.append(doc[prev:pos])
+        prev = pos
+    temp_sections.append(doc[prev:])
+
+    # Clean up - attach whitespace-only sections to the previous one
+    mini_sections = []
+    for section in temp_sections:
+        if section.strip():
+            mini_sections.append(section)
+        elif mini_sections:
+            mini_sections[-1] += section
+
+    # Cap at 70 to keep the prompt manageable - repeatedly merge smallest sections
+    if len(mini_sections) > 70:
+        while len(mini_sections) > 70:
+            sizes = [len(s) for s in mini_sections]
+            min_idx = sizes.index(min(sizes))
+            if min_idx < len(mini_sections) - 1:
+                mini_sections[min_idx] = mini_sections[min_idx] + mini_sections[min_idx + 1]
+                mini_sections.pop(min_idx + 1)
+            else:
+                mini_sections[min_idx - 1] = mini_sections[min_idx - 1] + mini_sections[min_idx]
+                mini_sections.pop(min_idx)
+
+    # Merge tiny sections (< 50 chars) only if we have breathing room
+    # If we're too close to target_slides, merging could leave us with too few
+    if len(mini_sections) > target_slides + 10:
+        i = 0
+        while i < len(mini_sections):
+            if len(mini_sections[i]) < 50:
+                if i < len(mini_sections) - 1:
+                    mini_sections[i] = mini_sections[i] + mini_sections[i + 1]
+                    mini_sections.pop(i + 1)
+                elif i > 0:
+                    mini_sections[i - 1] = mini_sections[i - 1] + mini_sections[i]
+                    mini_sections.pop(i)
+                    i -= 1
+                else:
+                    i += 1
+            else:
+                i += 1
+
+    if len(mini_sections) < target_slides:
+        return None
+
+    # Build previews for the LLM to see what's in each mini-section
+    section_previews = []
+    for i, sec in enumerate(mini_sections):
+        preview = sec.strip()[:100].replace('\n', ' ')
+        if len(sec.strip()) > 100:
+            preview += "..."
+        section_previews.append(f"{i}. [{len(sec)} chars] {preview}")
+
+    # Define Pydantic model for structured output validation
+    max_index = len(mini_sections) - 2
+    BoundedIndex = conint(ge=0, le=max_index)
+
+    class GroupingPlan(BaseModel):
+        split_after_indices: List[BoundedIndex] = Field(
+            min_length=target_slides - 1,
+            max_length=target_slides - 1
+        )
+
+        @field_validator('split_after_indices')
+        @classmethod
+        def validate_indices(cls, v):
+            if len(set(v)) != len(v):
+                raise ValueError(f'All {len(v)} indices must be unique, got only {len(set(v))} unique')
+            return sorted(v)
+
+    # Give LLM a starting point - evenly spaced indices that it can adjust
+    baseline = [int((i+1)*max_index/(target_slides-1)) for i in range(target_slides-1)]
+
+    prompt = f"""Split {len(mini_sections)} mini-sections into {target_slides} semantic sections.
+
+START with this baseline:
+{baseline}
+
+Then adjust each ±10% to align with topic boundaries. Requirements:
+- Return exactly {target_slides - 1} UNIQUE indices (0 to {max_index})
+- No duplicates
+- Last index must be > {int(0.85*max_index)}
+- For each baseline position, include ONE nearby index
+
+Mini-sections:
+{chr(10).join(section_previews)}"""
+
+    try:
+        resp = client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": f"You group mini-sections into {target_slides} balanced, semantically coherent sections."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format=GroupingPlan,
+            temperature=0,
+            timeout=INITIAL_API_TIMEOUT_SECONDS
+        )
+
+        indices = resp.choices[0].message.parsed.split_after_indices
+        logger.info(f"LLM returned indices: {indices}")
+
+        # Build final sections by grouping mini-sections according to the indices
+        # If indices = [5, 12], we create sections from mini[0:6], mini[6:13], mini[13:]
+        final_sections = []
+        start_idx = 0
+        for split_after in indices:
+            merged = ''.join(mini_sections[start_idx:split_after + 1])
+            final_sections.append(merged)
+            logger.info(f"Section {len(final_sections)}: mini[{start_idx}:{split_after+1}] = {len(merged)} chars")
+            start_idx = split_after + 1
+        final_sections.append(''.join(mini_sections[start_idx:]))
+        logger.info(f"Section {len(final_sections)} (final): mini[{start_idx}:] = {len(final_sections[-1])} chars")
+
+        if ''.join(final_sections) != doc:
+            return None
+
+        logger.info(f"Structured output succeeded by grouping {len(mini_sections)} mini-sections")
+        return final_sections
+
+    except Exception as e:
+        logger.warning(f"Structured output failed: {e}")
+        try:
+            from pydantic import ValidationError
+            if isinstance(e, ValidationError) and e.errors():
+                error = e.errors()[0]
+                if 'input' in error:
+                    actual_indices = error['input']
+                    logger.error(f"LLM returned {len(actual_indices)} indices: {actual_indices}")
+                    logger.error(f"Unique count: {len(set(actual_indices))}")
+        except:
+            pass
+        return None

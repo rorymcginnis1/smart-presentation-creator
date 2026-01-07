@@ -20,7 +20,6 @@ def main():
     print(f"Splitting {file_path} into {num_sections} sections...")
     sections = split_document_into_sections(document, num_sections)
 
-    # Print results
     print("\n" + "="*60)
     for i, section in enumerate(sections, 1):
         print(f"\n--- SECTION {i}/{len(sections)} ---")

@@ -5,7 +5,8 @@ from typing import List, Optional
 import openai
 from dotenv import load_dotenv
 from .config import MAX_RETRIES
-from .prompts import get_all_semantic_boundaries, select_n_boundaries
+from . import config
+from .prompts import get_all_semantic_boundaries, select_n_boundaries, single_pass_structured
 from .fallbacks import extract_valid_splits_from_failed_output, fallback_split
 from .adjustments import (
     combine_sections,
@@ -88,6 +89,18 @@ def _get_initial_sections(doc, target_slides, client, model):
 
     This decouples semantic understanding (LLM strength) from exact counting (LLM weakness).
     """
+    if config.USE_STRUCTURED_OUTPUTS:
+        for attempt in range(2):
+            result = single_pass_structured(doc, target_slides, client, model)
+            if result and len(result) == target_slides:
+                logger.info(f"Structured output succeeded: {len(result)} sections (attempt {attempt+1})")
+                return result
+            if attempt == 0:
+                logger.warning(f"Structured output failed on attempt {attempt+1}, retrying...")
+
+        logger.error("Structured output failed after 2 attempts")
+        raise ValueError(f"Structured output failed after 2 attempts for N={target_slides}")
+
     for attempt in range(MAX_RETRIES):
         # Phase 1: Get all semantic boundaries
         logger.info(f"Phase 1: Identifying all semantic boundaries (attempt {attempt + 1})")
